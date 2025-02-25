@@ -213,7 +213,21 @@ def parallel_matmul(x: Tensor, y: Tensor, transpose_y=False, tensor_parallel_out
         return logits
 
 
-def scaled_dot_product_attention(
+def shift(qkv, bsz, q_len, group_size, num_heads, head_dim):
+    if qkv.shape != [bsz, num_heads, q_len, head_dim]:
+        raise ValueError(f"qkv shape does not match expected shape {[bsz, num_heads, q_len, head_dim]}")
+
+    # Calculate the shift amount for rolling
+    shift_amount = -group_size // 2
+    # Roll the qkv tensor along the sequence length axis
+    qkv[:, num_heads // 2 :] = qkv[:, num_heads // 2 :].roll(shift_amount, axis=2)
+
+    # Reshape the tensor to the desired shape
+    qkv = qkv.reshape([bsz * (q_len // group_size), group_size, num_heads, head_dim])
+    return qkv
+
+
+def ssa_scaled_dot_product_attention(
     query_states,
     config,
     key_states,
@@ -225,13 +239,38 @@ def scaled_dot_product_attention(
     sequence_parallel=False,
     reshard_layer=None,
     npu_is_casual=False,
-    skip_recompute=False,
+    ssa_group_size_ratio=None,
 ):
     bsz, q_len, num_heads, head_dim = query_states.shape
     _, kv_seq_len, _, _ = value_states.shape
+    if config.context_parallel_degree > 1:
+        raise ValueError("Context parallel requires `use_flash_attention=True`")
 
+    # [ bz, seqlen, nhead, head_dim] -> [bs, nhead, seq_len, head_dim]
+    query_states = paddle.transpose(query_states, [0, 2, 1, 3])
+    # merge with the next tranpose
+    key_states = paddle.transpose(key_states, [0, 2, 1, 3])
+    value_states = paddle.transpose(value_states, [0, 2, 1, 3])
+    assert ssa_group_size_ratio is not None, "ssa_group_size_ratio must provide"
+
+    # Calculate the group size based on the sequence length and the group size ratio
+    group_size = q_len if int(q_len * ssa_group_size_ratio) == 0 else int(q_len * ssa_group_size_ratio)
+
+    # Ensure the sequence length is divisible by the group size
+    if q_len % group_size != 0:
+        raise ValueError(f"q_len {q_len} must be divisible by group size {group_size}.")
+
+    num_group = q_len // group_size
+
+    # Apply shifting to the query, key, and value states
+    query_states = shift(query_states, bsz, q_len, group_size, num_heads, head_dim)
+    key_states = shift(key_states, bsz, q_len, group_size, num_heads, head_dim)
+    value_states = shift(value_states, bsz, q_len, group_size, num_heads, head_dim)
+    query_states = paddle.transpose(query_states, [0, 2, 1, 3])
+    key_states = paddle.transpose(key_states, [0, 2, 1, 3])
+    value_states = paddle.transpose(value_states, [0, 2, 1, 3])
     if config.use_flash_attention and flash_attention:
-        return fusion_ops.fusion_flash_attention(
+        outputs = fusion_ops.fusion_flash_attention(
             query_states,
             config,
             key_states,
@@ -243,40 +282,26 @@ def scaled_dot_product_attention(
             sequence_parallel,
             reshard_layer,
             npu_is_casual,
-            skip_recompute=skip_recompute,
         )
-
-        # Paddle Flash Attention input [ bz, seqlen, nhead, head_dim]
-        # Torch Flash Attention input [ bz, nhead, seqlen, head_dim]
-
-    else:
-        if config.context_parallel_degree > 1:
-            raise ValueError("Context parallel requires `use_flash_attention=True`")
-
-        #  [ bz, seqlen, nhead, head_dim] -> [bs, nhead, seq_len, head_dim]
-        query_states = paddle.transpose(query_states, [0, 2, 1, 3])
-        # merge with the next tranpose
-        key_states = paddle.transpose(key_states, [0, 2, 1, 3])
-        value_states = paddle.transpose(value_states, [0, 2, 1, 3])
-
-        # Add pre divided factor to fix nan under float16.
-        if paddle.in_dynamic_mode() and query_states.dtype == paddle.float16:
-            pre_divided_factor = 32
+        if output_attentions:
+            attn_output, attn_weights = outputs
         else:
-            pre_divided_factor = 1
-
-        attn_weights = paddle.matmul(
-            query_states * (1 / (math.sqrt(head_dim) * pre_divided_factor)), key_states.transpose([0, 1, 3, 2])
-        )
+            attn_output = outputs
+    else:
+        # matmul and device by sqrt(head_dim)
+        if get_env_device() == "intel_hpu":
+            # optimize div(const) to mul(const) for better performance
+            attn_weights = paddle.matmul(query_states * (1 / math.sqrt(head_dim)), key_states.transpose([0, 1, 3, 2]))
+        else:
+            attn_weights = paddle.matmul(query_states / math.sqrt(head_dim), key_states.transpose([0, 1, 3, 2]))
 
         # then add alibi bias
         if alibi is not None:
             alibi = alibi.reshape([bsz, num_heads, 1, -1])
-            attn_weights = attn_weights + alibi / pre_divided_factor
-
-        if paddle.in_dynamic_mode() and attn_weights.shape != [bsz, num_heads, q_len, kv_seq_len]:
+            attn_weights = attn_weights + alibi
+        if paddle.in_dynamic_mode() and attn_weights.shape != [bsz * num_group, num_heads, group_size, group_size]:
             raise ValueError(
-                f"Attention weights should be of shape {(bsz, num_heads, q_len, kv_seq_len)}, but is"
+                f"Attention weights should be of shape {(bsz * num_group, num_heads, group_size, group_size)}, but is"
                 f" {attn_weights.shape}"
             )
 
@@ -284,28 +309,28 @@ def scaled_dot_product_attention(
         if reshard_layer is not None:
             attention_mask = None
 
-        # NOTE: we only call get_triangle_upper_mask under PP setup
-        # FIXME ZHUI when we use pipeline parallel, the attention_mask can be None
-        # we just make it triangle_upper_mask
         if attention_mask is None:
             attention_mask = get_triangle_upper_mask(attn_weights)
-        attention_mask = attention_mask.reshape([bsz, 1, q_len, kv_seq_len])
-        if paddle.in_dynamic_mode() and attention_mask.shape != [bsz, 1, q_len, kv_seq_len]:
-            raise ValueError(
-                f"Attention mask should be of shape {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.shape}"
-            )
+        attention_mask = paddle.tile(
+            paddle.cast(attention_mask[:, :, :group_size, :group_size], dtype="float32"), [num_group, 1, 1, 1]
+        )
+
+        if attention_mask.shape != [bsz * num_group, 1, group_size, group_size]:
+            attention_mask = attention_mask[: bsz * num_group, :, :, :]
 
         attn_weights = attn_weights + attention_mask
         if not paddle.in_dynamic_mode():
             attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").astype(query_states.dtype)
         else:
             with paddle.amp.auto_cast(False):
-                attn_weights = F.softmax(attn_weights.astype("float32") * pre_divided_factor, axis=-1).astype(
-                    query_states.dtype
-                )
+                attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").astype(query_states.dtype)
 
         attn_output = paddle.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose([0, 2, 1, 3])
+
+        # shift back
+        attn_output = attn_output.reshape([bsz, q_len, num_heads, head_dim])
+        attn_output[:, :, num_heads // 2 :] = attn_output[:, :, num_heads // 2 :].roll(group_size // 2, axis=1)
 
         if reshard_layer is not None:
             attn_output = reshard_layer(
@@ -321,6 +346,133 @@ def scaled_dot_product_attention(
         else:
             attn_output = attn_output.reshape([bsz, q_len, head_dim * num_heads])
         return (attn_output, attn_weights) if output_attentions else attn_output
+
+
+def scaled_dot_product_attention(
+    query_states,
+    config,
+    key_states,
+    value_states,
+    attention_mask,
+    output_attentions,
+    alibi=None,
+    attn_mask_startend_row_indices=None,
+    sequence_parallel=False,
+    reshard_layer=None,
+    npu_is_casual=False,
+    skip_recompute=False,
+    use_ssa=False,
+    ssa_group_size_ratio=None,
+):
+    bsz, q_len, num_heads, head_dim = query_states.shape
+    _, kv_seq_len, _, _ = value_states.shape
+    if use_ssa:
+        return ssa_scaled_dot_product_attention(
+            query_states,
+            config,
+            key_states,
+            value_states,
+            attention_mask,
+            output_attentions,
+            alibi,
+            attn_mask_startend_row_indices,
+            sequence_parallel,
+            reshard_layer,
+            npu_is_casual,
+            ssa_group_size_ratio,
+        )
+    else:
+        if config.use_flash_attention and flash_attention:
+            return fusion_ops.fusion_flash_attention(
+                query_states,
+                config,
+                key_states,
+                value_states,
+                attention_mask,
+                output_attentions,
+                alibi,
+                attn_mask_startend_row_indices,
+                sequence_parallel,
+                reshard_layer,
+                npu_is_casual,
+                skip_recompute=skip_recompute,
+            )
+
+            # Paddle Flash Attention input [ bz, seqlen, nhead, head_dim]
+            # Torch Flash Attention input [ bz, nhead, seqlen, head_dim]
+
+        else:
+            if config.context_parallel_degree > 1:
+                raise ValueError("Context parallel requires `use_flash_attention=True`")
+
+            #  [ bz, seqlen, nhead, head_dim] -> [bs, nhead, seq_len, head_dim]
+            query_states = paddle.transpose(query_states, [0, 2, 1, 3])
+            # merge with the next tranpose
+            key_states = paddle.transpose(key_states, [0, 2, 1, 3])
+            value_states = paddle.transpose(value_states, [0, 2, 1, 3])
+
+            # Add pre divided factor to fix nan under float16.
+            if paddle.in_dynamic_mode() and query_states.dtype == paddle.float16:
+                pre_divided_factor = 32
+            else:
+                pre_divided_factor = 1
+
+            attn_weights = paddle.matmul(
+                query_states * (1 / (math.sqrt(head_dim) * pre_divided_factor)), key_states.transpose([0, 1, 3, 2])
+            )
+
+            # then add alibi bias
+            if alibi is not None:
+                alibi = alibi.reshape([bsz, num_heads, 1, -1])
+                attn_weights = attn_weights + alibi / pre_divided_factor
+
+            if paddle.in_dynamic_mode() and attn_weights.shape != [bsz, num_heads, q_len, kv_seq_len]:
+                raise ValueError(
+                    f"Attention weights should be of shape {(bsz, num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.shape}"
+                )
+
+            # In sep mode, the attenion mask should be created in the runtime.
+            if reshard_layer is not None:
+                attention_mask = None
+
+            # NOTE: we only call get_triangle_upper_mask under PP setup
+            # FIXME ZHUI when we use pipeline parallel, the attention_mask can be None
+            # we just make it triangle_upper_mask
+            if attention_mask is None:
+                attention_mask = get_triangle_upper_mask(attn_weights)
+            attention_mask = attention_mask.reshape([bsz, 1, q_len, kv_seq_len])
+            if paddle.in_dynamic_mode() and attention_mask.shape != [bsz, 1, q_len, kv_seq_len]:
+                raise ValueError(
+                    f"Attention mask should be of shape {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.shape}"
+                )
+
+            attn_weights = attn_weights + attention_mask
+            if not paddle.in_dynamic_mode():
+                attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").astype(query_states.dtype)
+            else:
+                with paddle.amp.auto_cast(False):
+                    attn_weights = F.softmax(attn_weights.astype("float32") * pre_divided_factor, axis=-1).astype(
+                        query_states.dtype
+                    )
+
+            attn_output = paddle.matmul(attn_weights, value_states)
+            attn_output = attn_output.transpose([0, 2, 1, 3])
+
+            if reshard_layer is not None:
+                attn_output = reshard_layer(
+                    attn_output,
+                    split_axis=1,
+                    concat_axis=2,
+                )
+                q_len = q_len // config.sep_parallel_degree
+                num_heads = num_heads * config.sep_parallel_degree
+
+            if sequence_parallel:
+                attn_output = attn_output.reshape([bsz * q_len, head_dim * num_heads])
+            else:
+                attn_output = attn_output.reshape([bsz, q_len, head_dim * num_heads])
+            return (attn_output, attn_weights) if output_attentions else attn_output
 
 
 def masked_fill(x, mask, value):
@@ -932,7 +1084,6 @@ class LlamaAttention(nn.Layer):
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
         # [bs, seq_len, num_head * head_dim] -> [seq_len / n, bs, num_head * head_dim] (n is model parallelism)
-
         if self.fuse_attention_qkv:
             mix_layer = self.qkv_proj(hidden_states)
             # NOTE for GQA attention fusion (compatible with MHA and MQA):
@@ -1134,6 +1285,8 @@ class LlamaAttention(nn.Layer):
                 sequence_parallel=self.sequence_parallel,
                 reshard_layer=self.reshard_layer,
                 use_reentrant=self.config.recompute_use_reentrant,
+                use_ssa=self.config.use_ssa,
+                ssa_group_size_ratio=self.config.ssa_group_size_ratio,
             )
         else:
             outputs = self.attn_func(
@@ -1148,12 +1301,13 @@ class LlamaAttention(nn.Layer):
                 sequence_parallel=self.sequence_parallel,
                 reshard_layer=self.reshard_layer,
                 npu_is_casual=npu_is_casual,
+                use_ssa=self.config.use_ssa,
+                ssa_group_size_ratio=self.config.ssa_group_size_ratio,
             )
         if output_attentions:
             attn_output, attn_weights = outputs
         else:
             attn_output = outputs
-
         # if sequence_parallel is true, out shape are [q_len / n, bs, num_head * head_dim]
         # else their shape are [bs, q_len, num_head * head_dim], n is mp parallelism.
         attn_output = self.o_proj(attn_output)
@@ -1171,7 +1325,6 @@ class LlamaAttention(nn.Layer):
 
         if type(outputs) is tuple and len(outputs) == 1:
             outputs = outputs[0]
-
         return outputs
 
 

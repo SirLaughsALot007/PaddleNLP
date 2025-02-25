@@ -168,6 +168,13 @@ def main():
         quantization_config=quantization_config,
     )
 
+    if training_args.use_ssa:
+        assert (
+            training_args.ssa_group_size_ratio is not None
+        ), "ssa_group_size_ratio must be specified when use_ssa is True"
+        model_config.use_ssa = True
+        model_config.ssa_group_size_ratio = training_args.ssa_group_size_ratio
+
     architectures_to_check = {"Qwen2Moe", "DeepseekV2", "DeepseekV3"}
     if (
         any(architecture in str(model_config.architectures) for architecture in architectures_to_check)
@@ -192,6 +199,8 @@ def main():
         model_config.fuse_attention_ffn = model_args.fuse_attention_ffn
 
     model_config.seq_length = data_args.max_length
+    orig_ctx_len = getattr(model_config, "max_position_embeddings", None)
+    model_args.rope_scaling_factor = data_args.max_length // orig_ctx_len
 
     # Config for model useing long sequence strategy
     if model_args.use_long_sequence_strategies:
