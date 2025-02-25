@@ -4866,10 +4866,6 @@ class TestLongSequenceStrategiesTest(LLMTest, unittest.TestCase):
 
     def get_model(self, model_name_or_path):
         model_config = AutoConfig.from_pretrained(model_name_or_path)
-        if self.strategy_type == "embedding_strategies":
-            model_config.alibi = False
-        else:
-            model_config.alibi = True
         model_config.use_long_sequence_strategies = True
         model_config.long_sequence_strategy_type = self.strategy_type
         model_config.long_sequence_strategy_name = self.strategy_name
