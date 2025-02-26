@@ -4853,7 +4853,7 @@ all_ppl = [
     ],
 )
 class TestLongSequenceStrategiesTest(LLMTest, unittest.TestCase):
-    config_path: str = "./tests/fixtures/llm/longlora.yaml"
+    config_path: str = "./tests/fixtures/llm/predictor.yaml"
     root_path = ""
 
     def setUp(self) -> None:
