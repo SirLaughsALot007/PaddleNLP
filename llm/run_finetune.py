@@ -66,6 +66,7 @@ from paddlenlp.transformers import (
     Qwen2MoeForCausalLMPipe,
 )
 from paddlenlp.transformers.configuration_utils import LlmMetaConfig
+from paddlenlp.transformers.longlora import replace_llama_attn, set_group_size
 from paddlenlp.trl import DataConfig, ModelConfig, SFTConfig, SFTTrainer
 from paddlenlp.trl.llm_utils import (
     ZeroPaddingIterDatasetCallback,
@@ -172,8 +173,8 @@ def main():
         assert (
             training_args.ssa_group_size_ratio is not None
         ), "ssa_group_size_ratio must be specified when use_ssa is True"
-        model_config.use_ssa = True
-        model_config.ssa_group_size_ratio = training_args.ssa_group_size_ratio
+        set_group_size(training_args.ssa_group_size_ratio)
+        replace_llama_attn()
 
     architectures_to_check = {"Qwen2Moe", "DeepseekV2", "DeepseekV3"}
     if (

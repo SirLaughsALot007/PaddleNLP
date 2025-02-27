@@ -159,8 +159,6 @@ class LlamaConfig(PretrainedConfig):
         use_last_token_for_generation=False,
         immediate_clear_past_key_value=False,
         dpo_config=None,
-        use_ssa=False,
-        ssa_group_size_ratio=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -199,8 +197,6 @@ class LlamaConfig(PretrainedConfig):
         self.use_last_token_for_generation = use_last_token_for_generation
         self.immediate_clear_past_key_value = immediate_clear_past_key_value
         self.dpo_config = dpo_config
-        self.use_ssa = use_ssa
-        self.ssa_group_size_ratio = ssa_group_size_ratio
 
         super().__init__(
             pad_token_id=pad_token_id,
